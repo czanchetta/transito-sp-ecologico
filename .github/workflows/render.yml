@@ -1,0 +1,142 @@
+name: Render RMarkdown & Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'analysis/**'
+      - 'manuscript/**'
+      - 'R/**'
+      - 'renv.lock'
+      - '.github/workflows/render.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      RENV_PATHS_ROOT: ~/.local/share/renv
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.4.0'
+          use-public-rspm: true
+
+      - name: Setup Pandoc
+        uses: r-lib/actions/setup-pandoc@v2
+
+      - name: Cache renv packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RENV_PATHS_ROOT }}
+          key: ${{ runner.os }}-renv-${{ hashFiles('**/renv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-renv-
+
+      - name: Install system dependencies (spatial)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libgdal-dev libgeos-dev libproj-dev libudunits2-dev \
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libharfbuzz-dev libfribidi-dev \
+            libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev
+
+      - name: Restore renv library
+        run: |
+          if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv")
+          renv::restore()
+        shell: Rscript {0}
+
+      - name: Render analysis notebooks
+        run: |
+          library(rmarkdown)
+          rmds <- list.files("analysis", pattern = "\\.Rmd$", full.names = TRUE)
+          for (f in rmds) {
+            message("Rendering: ", f)
+            rmarkdown::render(f, output_dir = "docs/analysis",
+                              output_format = "html_document",
+                              envir = new.env())
+          }
+        shell: Rscript {0}
+
+      - name: Render manuscript
+        run: |
+          library(rmarkdown)
+          manuscript <- list.files("manuscript", pattern = "\\.Rmd$",
+                                   full.names = TRUE)
+          for (f in manuscript) {
+            message("Rendering: ", f)
+            rmarkdown::render(f, output_dir = "docs",
+                              output_format = "html_document",
+                              envir = new.env())
+          }
+        shell: Rscript {0}
+
+      - name: Build index page
+        run: |
+          analysis_files <- list.files("docs/analysis", pattern = "\\.html$")
+          links <- paste0(
+            "<li><a href='analysis/", analysis_files, "'>",
+            tools::file_path_sans_ext(analysis_files), "</a></li>",
+            collapse = "\n"
+          )
+          manuscript_files <- list.files("docs", pattern = "\\.html$",
+                                         full.names = FALSE)
+          manuscript_files <- manuscript_files[manuscript_files != "index.html"]
+          mlinks <- paste0(
+            "<li><a href='", manuscript_files, "'>",
+            tools::file_path_sans_ext(manuscript_files), "</a></li>",
+            collapse = "\n"
+          )
+          html <- paste0(
+            "<!DOCTYPE html><html lang='pt-BR'><head>",
+            "<meta charset='UTF-8'>",
+            "<title>Trânsito SP Ecológico</title>",
+            "<style>body{font-family:sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}</style>",
+            "</head><body>",
+            "<h1>Análise Ecológica de Acidentes de Trânsito — SP</h1>",
+            "<h2>Análises</h2><ul>", links, "</ul>",
+            "<h2>Manuscrito</h2><ul>", mlinks, "</ul>",
+            "<hr><small>Gerado automaticamente em ",
+            format(Sys.time(), "%d/%m/%Y %H:%M UTC"), "</small>",
+            "</body></html>"
+          )
+          writeLines(html, "docs/index.html")
+        shell: Rscript {0}
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: render
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
