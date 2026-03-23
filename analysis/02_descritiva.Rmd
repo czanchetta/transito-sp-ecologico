@@ -60,9 +60,10 @@ registrar_objeto <- function(nome, obj) {
 # ---------------------------------------------------------------------------
 normalizar_mun <- function(x) {
   x |>
-    iconv(from = "UTF-8", to = "ASCII//TRANSLIT") |>
+    str_replace_all("'", " ") |>      # apóstrofo → espaço antes de transliterar
+    iconv(from = "UTF-8", to = "ASCII//TRANSLIT") |>  # remove acentos
     toupper() |>
-    str_remove_all("[^A-Z0-9 ]") |>   # remove apóstrofos, hífens etc.
+    str_remove_all("[^A-Z0-9 ]") |>   # remove hífens e outros caracteres residuais
     str_squish()
 }
 ```
@@ -159,6 +160,25 @@ if (!is.null(tab6579_sp) && !is.null(base_analise)) {
     mutate(ano = as.integer(ano)) |>
     filter(ano %in% 2019:2024) |>
     select(cod_ibge, municipio, ano, populacao)
+
+  # Patch: São Luís do Paraitinga — Tab6579 grafa "Luiz" (z), InfoSiga grafa "Luis" (s)
+  # O cod_ibge (3550001) é usado diretamente para garantir a correspondência
+  if (!"3550001" %in% pop_mun_anual$cod_ibge &&
+      any(str_detect(tab6579_sp$mun_norm, "PARAITINGA"))) {
+    paraitinga_pop <- tab6579_sp |>
+      filter(str_detect(mun_norm, "PARAITINGA")) |>
+      pivot_longer(cols = starts_with("y"), names_to = "ano",
+                   names_prefix = "y", values_to = "populacao") |>
+      mutate(
+        ano       = as.integer(ano),
+        cod_ibge  = "3550001",
+        municipio = "SAO LUIS DO PARAITINGA"
+      ) |>
+      filter(ano %in% 2019:2024) |>
+      select(cod_ibge, municipio, ano, populacao)
+    pop_mun_anual <- bind_rows(pop_mun_anual, paraitinga_pop)
+    cat("Patch aplicado: São Luís do Paraitinga (3550001) via nome alternativo Tab6579.\n")
+  }
 
   n_match  <- n_distinct(pop_mun_anual$cod_ibge)
   n_total6 <- nrow(tab6579_sp)
@@ -647,10 +667,15 @@ taxa bruta.
 pop_mun_prop <- NULL
 
 if (!is.null(tab9514_mun) && !is.null(pop_mun_anual) && !is.null(pop_padrao)) {
-  # Lookup município
+  # Lookup município; inclui nome alternativo de Paraitinga (z vs s)
   lookup_ibge <- base_analise |>
     distinct(cod_ibge, municipio) |>
-    mutate(mun_norm = normalizar_mun(municipio))
+    mutate(mun_norm = normalizar_mun(municipio)) |>
+    bind_rows(tibble(
+      cod_ibge  = "3550001",
+      municipio = "SAO LUIS DO PARAITINGA",
+      mun_norm  = "SAO LUIZ DO PARAITINGA"   # grafia da Tab9514
+    ))
 
   # Formata tab9514_mun em long: cod_ibge × faixa_infosiga × sexo → prop_censo
   tab9514_long <- tab9514_mun |>
@@ -733,6 +758,56 @@ if (!is.null(pessoas)) {
 }
 
 registrar_objeto("obitos_estrato", obitos_estrato)
+```
+
+## Comparação de Fontes de Óbitos
+
+As duas fontes de dados disponíveis registram óbitos em trânsito de formas
+distintas, o que gera diferenças esperadas nos totais anuais:
+
+- **`base_analise` (`n_obitos`)** — agrega os campos `qtd_gravidade_fatal` da
+  tabela de sinistros InfoSiga por município × ano. Cada linha representa um
+  sinistro; múltiplas vítimas fatais no mesmo sinistro são somadas no campo
+  `qtd_gravidade_fatal`. Além disso, inclui apenas os municípios que possuem
+  correspondência com a Tabela 6579 (população disponível).
+- **`obitos_estrato` (`d_estrato`)** — conta registros individuais na tabela
+  `pessoas` com `gravidade_lesao == "FATAL"`, excluindo os registros com
+  faixa etária ou sexo não informados (`NAO DISPONIVEL`). Representa vítimas
+  únicas, não sinistros.
+
+A diferença percentual entre as duas fontes é uma métrica da **cobertura da
+tabela `pessoas`**: se for próxima de zero, a tabela de vítimas individuais
+está alinhada com a tabela de sinistros; se for positiva, indica vítimas
+não incluídas em `pessoas` (ex.: registros sem faixa etária/sexo).
+
+```{r diagnostico-obitos}
+if (!is.null(base_analise) && !is.null(obitos_estrato)) {
+
+  # Fonte (a): n_obitos de base_analise (sinistros agregados)
+  obitos_ba <- base_analise |>
+    group_by(ano) |>
+    summarise(n_ba = sum(n_obitos, na.rm = TRUE), .groups = "drop")
+
+  # Fonte (b): d_estrato de obitos_estrato (vítimas individuais, sem NAO DISPONIVEL)
+  obitos_oe <- obitos_estrato |>
+    group_by(ano) |>
+    summarise(n_oe = sum(d_estrato, na.rm = TRUE), .groups = "drop")
+
+  obitos_ba |>
+    left_join(obitos_oe, by = "ano") |>
+    mutate(
+      dif_abs = n_ba - n_oe,
+      dif_pct = round((n_ba - n_oe) / n_ba * 100, 1)
+    ) |>
+    knitr::kable(
+      caption   = paste0("Comparação de Óbitos por Fonte — ",
+                         "base_analise vs obitos_estrato (2019–2024)"),
+      col.names = c("Ano", "base_analise (sinistros)",
+                    "obitos_estrato (pessoas)", "Dif. absoluta", "Dif. %")
+    )
+} else {
+  cat("Dados insuficientes para comparação.\n")
+}
 ```
 
 ## Cálculo da Taxa Padronizada Direta (TPD)
@@ -924,6 +999,123 @@ if (n_ok == n_total) {
   cat('<p style="color:#c0392b;font-size:1.1em;font-weight:bold;">',
       '&#9888; Descritiva parcial:', n_ok, '/', n_total,
       'objetos OK. Verifique os ausentes acima.</p>\n')
+}
+```
+
+---
+
+# Diagnóstico de Qualidade dos Dados
+
+## Municípios com Alta TPD e Baixa População
+
+Municípios pequenos (população média < 10.000 hab.) com taxa padronizada de
+mortalidade elevada (TPD média > 50 por 100.000 hab.) são identificados como
+**instáveis**: poucos óbitos produzem taxas extremas por efeito de pequenos
+números (*small-number problem*). Esses municípios deverão receber tratamento
+especial na modelagem (ex.: suavização bayesiana, agrupamento ou exclusão).
+
+```{r municipios-instaveis}
+mun_instaveis <- NULL
+
+if (!is.null(tpm_mun) && !is.null(base_analise)) {
+
+  # Anos com pelo menos 1 óbito, por município
+  anos_com_obito <- base_analise |>
+    filter(n_obitos > 0) |>
+    count(cod_ibge, name = "n_anos_com_obito")
+
+  mun_instaveis <- tpm_mun |>
+    group_by(cod_ibge, municipio) |>
+    summarise(
+      pop_media = round(mean(populacao, na.rm = TRUE)),
+      tpm_media = round(mean(tpm,       na.rm = TRUE), 2),
+      tbm_media = round(mean(tbm,       na.rm = TRUE), 2),
+      .groups   = "drop"
+    ) |>
+    filter(pop_media < 10000, tpm_media > 50) |>
+    left_join(anos_com_obito, by = "cod_ibge") |>
+    replace_na(list(n_anos_com_obito = 0)) |>
+    arrange(desc(tpm_media))
+
+  cat(sprintf("Municípios instáveis identificados: %d\n", nrow(mun_instaveis)))
+
+  if (nrow(mun_instaveis) > 0) {
+    # Salva para uso na etapa de modelagem
+    saveRDS(mun_instaveis,
+            file.path(here("data/processed"), "municipios_instaveis.rds"))
+    cat("Salvo em data/processed/municipios_instaveis.rds\n\n")
+
+    mun_instaveis |>
+      mutate(pop_media = format(pop_media, big.mark = ".")) |>
+      knitr::kable(
+        caption   = "Municípios Instáveis: pop. < 10.000 hab. e TPD > 50/100k",
+        col.names = c("Cód. IBGE", "Município", "Pop. média",
+                      "TPD média", "TBM média", "Anos c/ óbito")
+      )
+  } else {
+    cat("Nenhum município atende aos critérios de instabilidade definidos.\n")
+  }
+} else {
+  cat("tpm_mun não disponível.\n")
+}
+```
+
+## Municípios sem Correspondência Populacional
+
+Identifica os municípios presentes em `base_analise` que não obtiveram
+correspondência na Tabela 6579 (estimativas populacionais) durante o join
+por nome. Esses municípios ficam **sem taxas calculadas** (TBM, TBNF, TPD).
+
+```{r municipios-sem-pop}
+if (!is.null(base_analise) && !is.null(pop_mun_anual)) {
+
+  # Municípios em base_analise SEM população atribuída
+  sem_pop <- base_analise |>
+    distinct(cod_ibge, municipio) |>
+    anti_join(pop_mun_anual |> distinct(cod_ibge), by = "cod_ibge") |>
+    mutate(norm_ba = normalizar_mun(municipio))
+
+  cat(sprintf("Municípios sem correspondência: %d de %d (%.1f%%)\n",
+              nrow(sem_pop),
+              n_distinct(base_analise$cod_ibge),
+              nrow(sem_pop) / n_distinct(base_analise$cod_ibge) * 100))
+
+  if (nrow(sem_pop) > 0 && !is.null(tab6579_sp)) {
+
+    # Investiga: o problema é o código IBGE (ausente em 6579) ou o nome?
+    # Tenta match removendo todos os espaços (apostrófo vira junção de palavras)
+    match_nospc <- sem_pop |>
+      mutate(norm_nospc = str_remove_all(norm_ba, " ")) |>
+      left_join(
+        tab6579_sp |>
+          mutate(norm_nospc = str_remove_all(mun_norm, " ")) |>
+          select(municipio_6579 = municipio_nome, norm_nospc),
+        by = "norm_nospc"
+      ) |>
+      select(cod_ibge, municipio, norm_ba, municipio_6579)
+
+    n_nome_match <- sum(!is.na(match_nospc$municipio_6579))
+    cat(sprintf(
+      "Diagnóstico: %d/%d encontrados na Tab. 6579 após remover espaços.\n",
+      n_nome_match, nrow(sem_pop)))
+    cat("Causa: apostrófo em nomes 'D\\'Oeste' → 'DOESTE' (6579) vs 'D OESTE' (InfoSiga).\n\n")
+
+    match_nospc |>
+      mutate(
+        causa = if_else(!is.na(municipio_6579),
+                        "Nome: apóstrofo → espaço ausente",
+                        "Investigar: cod_ibge ausente em Tab. 6579")
+      ) |>
+      knitr::kable(
+        caption   = "Municípios sem correspondência — Diagnóstico",
+        col.names = c("Cód. IBGE", "Nome (InfoSiga)",
+                      "Normalizado (base)", "Nome (Tab. 6579)", "Causa provável")
+      )
+  } else if (nrow(sem_pop) == 0) {
+    cat("Todos os municípios possuem correspondência populacional.\n")
+  }
+} else {
+  cat("Dados insuficientes.\n")
 }
 ```
 
