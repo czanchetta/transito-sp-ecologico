@@ -1,0 +1,937 @@
+---
+title: "Análise Ecológica de Acidentes de Trânsito — SP"
+subtitle: "Etapa 1: Importação e Limpeza dos Dados"
+author: "czanchetta"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+# Define raiz do projeto como diretório de trabalho para todos os chunks
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+# Setup
+
+Carrega todos os pacotes e opções globais do projeto via `R/00_setup.R`.
+Inicializa a lista global de rastreamento de arquivos ausentes e objetos carregados.
+
+```{r setup-pacotes, echo=TRUE, warning=FALSE, message=FALSE}
+library(here)       # deve ser carregado antes de source(here::here(...))
+library(readxl)
+source(here::here("R/00_setup.R"))
+
+# ---------------------------------------------------------------------------
+# Rastreamento de arquivos ausentes e objetos carregados
+# ---------------------------------------------------------------------------
+arquivos_ausentes <- list()   # lista de tibbles com caminho + secao
+objetos_carregados <- list()  # lista de tibbles com nome + nrow
+
+registrar_ausente <- function(caminho, secao) {
+  arquivos_ausentes[[length(arquivos_ausentes) + 1]] <<- tibble(
+    secao   = secao,
+    caminho = caminho
+  )
+  warning("Arquivo não encontrado: ", caminho, call. = FALSE)
+}
+
+registrar_objeto <- function(nome, obj) {
+  n <- if (is.null(obj)) NA_integer_ else nrow(obj)
+  objetos_carregados[[length(objetos_carregados) + 1]] <<- tibble(
+    objeto = nome,
+    linhas = n,
+    ok     = !is.null(obj)
+  )
+}
+```
+
+---
+
+# InfoSiga — Sinistros
+
+Os arquivos de sinistros são fornecidos em dois períodos: 2015–2021 e 2022–2025.
+Ambos estão em encoding Latin1 (ISO-8859-1). Após empilhamento, filtramos o
+período de análise (2019–2024) e padronizamos os nomes de colunas.
+
+```{r sinistros-leitura, warning=FALSE, message=FALSE}
+path_infosiga <- here("data/raw/Infosiga")
+
+ler_infosiga <- function(arquivo, secao = "InfoSiga") {
+  caminho <- file.path(path_infosiga, arquivo)
+  if (!file.exists(caminho)) {
+    registrar_ausente(caminho, secao)
+    return(NULL)
+  }
+  tryCatch(
+    read_csv2(caminho, locale = locale(encoding = "Latin1"),
+              show_col_types = FALSE),
+    error = function(e) {
+      registrar_ausente(caminho, paste0(secao, " [erro leitura: ", e$message, "]"))
+      NULL
+    }
+  )
+}
+
+sinistros_1521 <- ler_infosiga("sinistros_2015-2021.csv", "2 — Sinistros")
+sinistros_2225 <- ler_infosiga("sinistros_2022-2025.csv", "2 — Sinistros")
+
+sinistros_raw <- bind_rows(sinistros_1521, sinistros_2225)
+registrar_objeto("sinistros_raw", sinistros_raw)
+```
+
+```{r sinistros-limpar, warning=FALSE, message=FALSE}
+sinistros <- sinistros_raw |>
+  clean_names() |>
+  filter(ano_sinistro >= 2019, ano_sinistro <= 2024)
+
+glimpse(sinistros)
+```
+
+```{r sinistros-head, warning=FALSE, message=FALSE}
+head(sinistros, 5) |> knitr::kable(caption = "Primeiras 5 linhas — Sinistros")
+```
+
+```{r sinistros-missing, warning=FALSE, message=FALSE}
+cols_principais <- c(
+  "ano_sinistro", "cod_ibge", "municipio",
+  "qtd_gravidade_fatal", "qtd_gravidade_grave",
+  "qtd_gravidade_leve", "qtd_gravidade_ileso",
+  "tp_sinistro_atropelamento", "qtd_motocicleta",
+  "qtd_pedestre", "qtd_bicicleta"
+)
+
+cols_presentes <- intersect(cols_principais, names(sinistros))
+
+sinistros |>
+  select(all_of(cols_presentes)) |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variavel", values_to = "n_missing") |>
+  mutate(pct_missing = round(n_missing / nrow(sinistros) * 100, 2)) |>
+  knitr::kable(caption = "Valores missing nas colunas principais — Sinistros")
+```
+
+---
+
+# InfoSiga — Pessoas
+
+Arquivo com dados individuais das vítimas envolvidas nos sinistros.
+
+```{r pessoas-leitura, warning=FALSE, message=FALSE}
+pessoas_1521 <- ler_infosiga("pessoas_2015-2021.csv", "3 — Pessoas")
+pessoas_2225 <- ler_infosiga("pessoas_2022-2025.csv", "3 — Pessoas")
+
+pessoas <- bind_rows(pessoas_1521, pessoas_2225) |>
+  clean_names() |>
+  filter(ano_sinistro >= 2019, ano_sinistro <= 2024)
+
+registrar_objeto("pessoas", pessoas)
+glimpse(pessoas)
+```
+
+```{r pessoas-head, warning=FALSE, message=FALSE}
+head(pessoas, 5) |> knitr::kable(caption = "Primeiras 5 linhas — Pessoas")
+```
+
+```{r pessoas-freq, warning=FALSE, message=FALSE}
+if ("tipo_de_vitima" %in% names(pessoas)) {
+  pessoas |>
+    count(tipo_de_vitima, sort = TRUE) |>
+    mutate(pct = round(n / sum(n) * 100, 1)) |>
+    knitr::kable(caption = "Frequência — Tipo de Vítima")
+}
+```
+
+```{r pessoas-gravidade, warning=FALSE, message=FALSE}
+col_grav <- intersect(c("gravidade_lesao", "gravidade_da_lesao", "gravidade"),
+                      names(pessoas))
+
+if (length(col_grav) > 0) {
+  pessoas |>
+    count(.data[[col_grav[1]]], sort = TRUE) |>
+    mutate(pct = round(n / sum(n) * 100, 1)) |>
+    knitr::kable(caption = "Frequência — Gravidade da Lesão")
+}
+```
+
+---
+
+# InfoSiga — Veículos
+
+Arquivo com dados dos veículos envolvidos nos sinistros.
+
+```{r veiculos-leitura, warning=FALSE, message=FALSE}
+veiculos_1521 <- ler_infosiga("veiculos_2015-2021.csv", "4 — Veículos")
+veiculos_2225 <- ler_infosiga("veiculos_2022-2025.csv", "4 — Veículos")
+
+veiculos <- bind_rows(veiculos_1521, veiculos_2225) |>
+  clean_names() |>
+  filter(ano_sinistro >= 2019, ano_sinistro <= 2024)
+
+registrar_objeto("veiculos", veiculos)
+glimpse(veiculos)
+```
+
+```{r veiculos-head, warning=FALSE, message=FALSE}
+head(veiculos, 5) |> knitr::kable(caption = "Primeiras 5 linhas — Veículos")
+```
+
+```{r veiculos-freq, warning=FALSE, message=FALSE}
+col_tv <- intersect(c("tipo_veiculo", "tipo_de_veiculo"), names(veiculos))
+
+if (length(col_tv) > 0) {
+  veiculos |>
+    count(.data[[col_tv[1]]], sort = TRUE) |>
+    mutate(pct = round(n / sum(n) * 100, 1)) |>
+    knitr::kable(caption = "Frequência — Tipo de Veículo")
+}
+```
+
+---
+
+# Agregação por Município × Ano
+
+Consolida os sinistros em um painel municipal anual. As colunas `qtd_*` e
+`tp_sinistro_*` são coercidas para `numeric` antes de somar.
+
+```{r sinistros-agregar, warning=FALSE, message=FALSE}
+# Função auxiliar: garante cod_ibge como string de 7 dígitos
+padronizar_ibge <- function(x) {
+  str_pad(as.character(as.integer(x)), width = 7, side = "left", pad = "0")
+}
+
+# Coerce colunas qtd_* e tp_sinistro_* para numeric
+sinistros_num <- sinistros |>
+  mutate(
+    cod_ibge = padronizar_ibge(cod_ibge),
+    across(starts_with("qtd_"),         as.numeric),
+    across(starts_with("tp_sinistro_"), as.numeric)
+  )
+
+sinistros_mun <- sinistros_num |>
+  group_by(cod_ibge, municipio, ano_sinistro) |>
+  summarise(
+    n_obitos          = sum(qtd_gravidade_fatal,   na.rm = TRUE),
+    n_grave           = sum(qtd_gravidade_grave,   na.rm = TRUE),
+    n_leve            = sum(qtd_gravidade_leve,    na.rm = TRUE),
+    n_ileso           = sum(qtd_gravidade_ileso,   na.rm = TRUE),
+    n_nao_fatal       = n_grave + n_leve + n_ileso,
+    n_total_sinistros = n(),
+    n_atropelamento   = if ("tp_sinistro_atropelamento" %in% names(sinistros_num))
+                          sum(tp_sinistro_atropelamento, na.rm = TRUE) else NA_integer_,
+    n_moto            = if ("qtd_motocicleta" %in% names(sinistros_num))
+                          sum(qtd_motocicleta, na.rm = TRUE) else NA_integer_,
+    n_pedestre        = if ("qtd_pedestre" %in% names(sinistros_num))
+                          sum(qtd_pedestre, na.rm = TRUE) else NA_integer_,
+    n_bicicleta       = if ("qtd_bicicleta" %in% names(sinistros_num))
+                          sum(qtd_bicicleta, na.rm = TRUE) else NA_integer_,
+    .groups = "drop"
+  )
+
+registrar_objeto("sinistros_mun", sinistros_mun)
+glimpse(sinistros_mun)
+```
+
+```{r sinistros-resumo-ano, warning=FALSE, message=FALSE}
+sinistros_mun |>
+  group_by(ano_sinistro) |>
+  summarise(
+    municipios     = n_distinct(cod_ibge),
+    sinistros      = sum(n_total_sinistros),
+    obitos         = sum(n_obitos),
+    nao_fatais     = sum(n_nao_fatal),
+    atropelamentos = sum(n_atropelamento, na.rm = TRUE)
+  ) |>
+  knitr::kable(caption = "Totais por Ano — Sinistros Agregados")
+```
+
+---
+
+# População
+
+Estimativas populacionais do IBGE. Os anos 2022 e 2023 são obtidos por
+interpolação linear entre 2021 e 2024.
+
+```{r populacao-ler, warning=FALSE, message=FALSE}
+path_pop <- here("data/raw/População")   # pasta real no repositório
+
+ler_pop <- function(arquivo, ano) {
+  caminho <- file.path(path_pop, arquivo)
+  if (!file.exists(caminho)) {
+    registrar_ausente(caminho, "6 — População")
+    return(NULL)
+  }
+  tryCatch({
+    read_excel(caminho, skip = 1) |>
+      clean_names() |>
+      mutate(ano = ano)
+  }, error = function(e) {
+    registrar_ausente(caminho,
+                      paste0("6 — População [erro: ", e$message, "]"))
+    NULL
+  })
+}
+
+pop_2019 <- ler_pop("POP2019_20220905.xls", 2019)
+pop_2020 <- ler_pop("POP2020_20220905.xls", 2020)
+pop_2021 <- ler_pop("POP2021_20240624.xls", 2021)
+pop_2024 <- ler_pop("POP2024_20241230.xls", 2024)
+
+# Inspecionar nomes de colunas do primeiro arquivo disponível
+arq_disp <- Filter(Negate(is.null), list(pop_2019, pop_2021))
+if (length(arq_disp) > 0) {
+  cat("Colunas detectadas:", paste(names(arq_disp[[1]]), collapse = ", "), "\n")
+} else {
+  cat("Nenhum arquivo de população encontrado.\n")
+}
+```
+
+```{r populacao-filtrar-sp, warning=FALSE, message=FALSE}
+padronizar_pop <- function(df, ano_ref) {
+  if (is.null(df)) return(NULL)
+  nms <- names(df)
+
+  # col_cod: coluna com "cod" exceto colunas de UF puras ou de nome puro
+  col_cod <- nms[str_detect(nms, "cod") &
+                   !str_detect(nms, "^uf|^sigla|^estado|^co_uf") &
+                   !str_detect(nms, "^nome$")][1]
+  # col_pop: coluna de população/estimativa
+  col_pop <- nms[str_detect(nms, "pop|estimativa|habitantes") |
+                   (str_detect(nms, "total") &
+                    !str_detect(nms, "uf|nome|cod"))][1]
+  # col_mun: coluna de nome do município (pode conter "cod" no nome completo)
+  col_mun <- nms[str_detect(nms, "nome|munic") & !str_detect(nms, "^cod$")][1]
+  # col_uf: coluna de UF
+  col_uf  <- nms[nms %in% c("uf", "sigla_uf", "estado", "co_uf", "uf_cod",
+                              "codigo_uf", "c_digo_uf", "sigla_da_uf")][1]
+
+  to_rename <- c(cod_ibge = col_cod, populacao = col_pop, municipio = col_mun)
+  to_rename <- to_rename[!is.na(to_rename) & names(to_rename) != to_rename]
+  if (length(to_rename) > 0) df <- rename(df, all_of(to_rename))
+
+  # Guarda: se cod_ibge ainda não existir, emite aviso e retorna NULL
+  if (!"cod_ibge" %in% names(df)) {
+    warning("padronizar_pop [", ano_ref, "]: 'cod_ibge' não detectado. ",
+            "Colunas: ", paste(names(df), collapse = ", "), call. = FALSE)
+    return(NULL)
+  }
+
+  if (!is.na(col_uf) && col_uf %in% names(df)) {
+    df <- df |> filter(str_detect(as.character(.data[[col_uf]]), "^35|^SP"))
+  }
+
+  df |>
+    mutate(
+      cod_ibge  = padronizar_ibge(cod_ibge),
+      populacao = as.numeric(str_remove_all(as.character(populacao), "[^0-9]")),
+      ano       = ano_ref
+    ) |>
+    select(any_of(c("cod_ibge", "municipio", "populacao", "ano"))) |>
+    filter(!is.na(cod_ibge), !is.na(populacao), str_starts(cod_ibge, "35"))
+}
+
+pop_sp_2019 <- padronizar_pop(pop_2019, 2019)
+pop_sp_2020 <- padronizar_pop(pop_2020, 2020)
+pop_sp_2021 <- padronizar_pop(pop_2021, 2021)
+pop_sp_2024 <- padronizar_pop(pop_2024, 2024)
+
+for (nm in c("pop_sp_2019","pop_sp_2020","pop_sp_2021","pop_sp_2024")) {
+  cat(" ", nm, ":", if (is.null(get(nm))) "NULL" else nrow(get(nm)), "linhas\n")
+}
+```
+
+```{r populacao-interpolar, warning=FALSE, message=FALSE}
+# Interpolação linear 2022–2023 apenas se 2021 e 2024 existirem
+if (!is.null(pop_sp_2021) && !is.null(pop_sp_2024)) {
+  base_interp <- pop_sp_2021 |>
+    rename(pop_2021 = populacao) |>
+    left_join(pop_sp_2024 |> select(cod_ibge, pop_2024 = populacao),
+              by = "cod_ibge")
+
+  interpolar_ano <- function(t) {
+    base_interp |>
+      mutate(
+        populacao = round(pop_2021 +
+                          (t - 2021) * (pop_2024 - pop_2021) / (2024 - 2021)),
+        ano = t
+      ) |>
+      select(cod_ibge, municipio, populacao, ano)
+  }
+
+  pop_sp_2022 <- interpolar_ano(2022)
+  pop_sp_2023 <- interpolar_ano(2023)
+} else {
+  cat("Interpolação impossível: pop_2021 ou pop_2024 ausente.\n")
+  pop_sp_2022 <- NULL
+  pop_sp_2023 <- NULL
+}
+
+# Painel 2019–2024
+populacao <- bind_rows(
+  pop_sp_2019, pop_sp_2020, pop_sp_2021,
+  pop_sp_2022, pop_sp_2023, pop_sp_2024
+)
+
+if (nrow(populacao) > 0) {
+  populacao <- arrange(populacao, cod_ibge, ano)
+  cat("Painel populacao:", nrow(populacao), "linhas,",
+      n_distinct(populacao$cod_ibge), "municípios únicos\n")
+} else {
+  cat("Painel de população vazio — verifique os arquivos em data/raw/População/\n")
+}
+
+registrar_objeto("populacao", if (nrow(populacao) > 0) populacao else NULL)
+```
+
+```{r populacao-complementar, warning=FALSE, message=FALSE}
+path_ibge <- here("data/raw/IBGE")
+
+if (file.exists(file.path(path_ibge, "Tabela 6579.xlsx"))) {
+  tab6579 <- read_excel(file.path(path_ibge, "Tabela 6579.xlsx")) |> clean_names()
+  cat("Tabela 6579 — dimensões:", nrow(tab6579), "×", ncol(tab6579), "\n")
+  head(tab6579, 3) |> knitr::kable(caption = "Tabela 6579 — Head")
+} else {
+  cat("Tabela 6579.xlsx não encontrada em data/raw/IBGE/\n")
+}
+
+if (file.exists(file.path(path_ibge, "Tabela 9514.xlsx"))) {
+  tab9514 <- read_excel(file.path(path_ibge, "Tabela 9514.xlsx")) |> clean_names()
+  cat("Tabela 9514 — dimensões:", nrow(tab9514), "×", ncol(tab9514), "\n")
+  head(tab9514, 3) |> knitr::kable(caption = "Tabela 9514 — Head")
+} else {
+  cat("Tabela 9514.xlsx não encontrada em data/raw/IBGE/\n")
+}
+```
+
+```{r populacao-final, warning=FALSE, message=FALSE}
+if (nrow(populacao) > 0) {
+  head(populacao, 5) |>
+    knitr::kable(caption = "Painel Populacional SP 2019–2024 — Head")
+  cat("Municípios únicos:", n_distinct(populacao$cod_ibge), "\n")
+} else {
+  cat("Base de população não disponível.\n")
+}
+```
+
+---
+
+# Frota de Veículos
+
+Dados da SENATRAN/DENATRAN de frota por município e tipo de veículo.
+
+```{r frota-leitura, warning=FALSE, message=FALSE}
+path_frota <- here("data/raw/frota")   # pasta real no repositório
+
+arquivos_frota <- tibble(
+  arquivo = c(
+    "frota_munic_modelo_julho_2019.xls",
+    "frota_munic_modelo_julho_2020.xls",
+    "frota_munic_modelo_julho_2021.xls",
+    "frota_munic_modelo_julho_2022.xls",
+    "frota_munic_modelo_julho_2023.xls",
+    "frota_munic_modelo_junho_2024.xlsx"
+  ),
+  ano = 2019:2024
+)
+
+ler_frota <- function(arquivo, ano) {
+  caminho <- file.path(path_frota, arquivo)
+  if (!file.exists(caminho)) {
+    registrar_ausente(caminho, "7 — Frota")
+    return(NULL)
+  }
+  tryCatch({
+    read_excel(caminho, skip = 3) |>
+      clean_names() |>
+      mutate(ano = ano)
+  }, error = function(e) {
+    registrar_ausente(caminho, paste0("7 — Frota [erro: ", e$message, "]"))
+    NULL
+  })
+}
+
+lista_frota <- map2(arquivos_frota$arquivo, arquivos_frota$ano, ler_frota)
+frota_raw   <- bind_rows(lista_frota)
+
+cat("Frota raw — dimensões:", nrow(frota_raw), "×", ncol(frota_raw), "\n")
+if (nrow(frota_raw) > 0) {
+  cat("Colunas disponíveis:\n")
+  print(names(frota_raw))
+}
+```
+
+```{r frota-limpar, warning=FALSE, message=FALSE}
+if (nrow(frota_raw) > 0) {
+  nms_frota <- names(frota_raw)
+  col_cod_frota <- nms_frota[
+    str_detect(nms_frota, "cod|ibge|municipio_cod|^codigo$") &
+    !str_detect(nms_frota, "^uf|^sigla|^estado|^co_uf") &
+    !str_detect(nms_frota, "^nome$|^municipio$")
+  ]
+  col_tot_frota <- nms_frota[
+    str_detect(nms_frota, "^total$|total_geral|frota_total")
+  ]
+
+  frota <- frota_raw
+  if (length(col_cod_frota) > 0 && col_cod_frota[1] != "cod_ibge") {
+    frota <- rename(frota, cod_ibge = all_of(col_cod_frota[1]))
+  }
+
+  if (!"cod_ibge" %in% names(frota)) {
+    warning("frota-limpar: coluna cod_ibge não encontrada. Colunas disponíveis: ",
+            paste(nms_frota, collapse = ", "))
+    frota <- NULL
+    registrar_objeto("frota", NULL)
+  } else {
+  frota <- frota |>
+    mutate(cod_ibge = padronizar_ibge(cod_ibge)) |>
+    filter(str_starts(cod_ibge, "35")) |>
+    arrange(cod_ibge, ano)
+
+  if (length(col_tot_frota) > 0) {
+    cat("Coluna de total encontrada:", col_tot_frota[1], "\n")
+    if (col_tot_frota[1] != "total_veiculos")
+      frota <- rename(frota, total_veiculos = all_of(col_tot_frota[1]))
+  } else {
+    cat("Sem coluna de total. Somando categorias numéricas...\n")
+    cols_num <- frota |>
+      select(-cod_ibge, -ano) |>
+      select(where(is.numeric)) |>
+      names()
+    frota <- frota |>
+      mutate(total_veiculos = rowSums(across(all_of(cols_num)), na.rm = TRUE))
+  }
+
+  registrar_objeto("frota", frota)
+  glimpse(frota)
+  } # end else cod_ibge found
+} else {
+  frota <- NULL
+  registrar_objeto("frota", NULL)
+  cat("Nenhum arquivo de frota encontrado.\n")
+}
+```
+
+```{r frota-head, warning=FALSE, message=FALSE}
+if (!is.null(frota)) {
+  head(frota, 5) |> knitr::kable(caption = "Frota SP 2019–2024 — Head")
+}
+```
+
+---
+
+# IDHM
+
+Índice de Desenvolvimento Humano Municipal.
+
+```{r idhm-leitura, warning=FALSE, message=FALSE}
+path_idhm_arq <- here("data/raw/IDHM/data.xlsx")
+
+if (!file.exists(path_idhm_arq)) {
+  registrar_ausente(path_idhm_arq, "8 — IDHM")
+  idhm <- NULL
+} else {
+  idhm <- tryCatch({
+    read_excel(path_idhm_arq) |> clean_names()
+  }, error = function(e) {
+    registrar_ausente(path_idhm_arq,
+                      paste0("8 — IDHM [erro: ", e$message, "]"))
+    NULL
+  })
+}
+
+if (!is.null(idhm)) glimpse(idhm) else cat("IDHM não disponível.\n")
+```
+
+```{r idhm-filtrar, warning=FALSE, message=FALSE}
+if (!is.null(idhm)) {
+  nms_idhm <- names(idhm)
+  col_cod_idhm <- nms_idhm[
+    str_detect(nms_idhm, "cod|ibge|codmun") &
+    !str_detect(nms_idhm, "^uf|^sigla|^estado|^co_uf") &
+    !str_detect(nms_idhm, "^nome$|^municipio$")
+  ]
+
+  if (length(col_cod_idhm) > 0 && col_cod_idhm[1] != "cod_ibge")
+    idhm <- rename(idhm, cod_ibge = all_of(col_cod_idhm[1]))
+
+  if (!"cod_ibge" %in% names(idhm)) {
+    warning("idhm-filtrar: coluna cod_ibge não encontrada. Colunas: ",
+            paste(nms_idhm, collapse = ", "))
+    idhm <- NULL
+  } else {
+    idhm <- idhm |>
+      mutate(cod_ibge = padronizar_ibge(cod_ibge)) |>
+      filter(str_starts(cod_ibge, "35"))
+
+    col_ano_idhm <- names(idhm)[str_detect(names(idhm), "^ano$|^year$|ano_ref")]
+    if (length(col_ano_idhm) > 0) {
+      cat("Anos disponíveis no IDHM:",
+          paste(unique(idhm[[col_ano_idhm[1]]]), collapse = ", "), "\n")
+    } else {
+      cat("Sem coluna de ano — IDHM de um único ano de referência.\n")
+    }
+
+    cat("Municípios SP no IDHM:", n_distinct(idhm$cod_ibge), "\n")
+    head(idhm, 5) |> knitr::kable(caption = "IDHM SP — Head")
+  }
+}
+
+registrar_objeto("idhm", idhm)
+```
+
+---
+
+# CNH — Condutores Habilitados
+
+Dados da SENATRAN com número de condutores habilitados por município (posição
+de junho de cada ano).
+
+```{r cnh-leitura, warning=FALSE, message=FALSE}
+path_cnh <- here("data/raw/CNH")
+
+arquivos_cnh <- tibble(
+  arquivo = c(
+    "condutores_habilitados_2019-06.csv",
+    "condutores_habilitados_2020-06.csv",
+    "condutores_habilitados_2021-06.csv",
+    "condutores_habilitados_2022_06.csv",
+    "condudores_habilitados_2023_06.csv",   # typo no nome original
+    "QuantidadedecondutoreshabilitadosporregioufsexofaixaetriaporcategoriaJun2024.csv"
+  ),
+  ano = 2019:2024
+)
+
+ler_cnh <- function(arquivo, ano) {
+  caminho <- file.path(path_cnh, arquivo)
+  if (!file.exists(caminho)) {
+    registrar_ausente(caminho, "9 — CNH")
+    return(NULL)
+  }
+  tryCatch({
+    df <- tryCatch(
+      read_csv2(caminho, locale = locale(encoding = "Latin1"),
+                show_col_types = FALSE),
+      error = function(e)
+        read_csv(caminho, locale = locale(encoding = "Latin1"),
+                 show_col_types = FALSE)
+    )
+    df |> clean_names() |> mutate(ano = ano)
+  }, error = function(e) {
+    registrar_ausente(caminho, paste0("9 — CNH [erro: ", e$message, "]"))
+    NULL
+  })
+}
+
+lista_cnh <- map2(arquivos_cnh$arquivo, arquivos_cnh$ano, ler_cnh)
+cnh_raw   <- bind_rows(lista_cnh)
+
+cat("CNH raw — dimensões:", nrow(cnh_raw), "×", ncol(cnh_raw), "\n")
+if (nrow(cnh_raw) > 0) print(names(cnh_raw))
+```
+
+```{r cnh-limpar, warning=FALSE, message=FALSE}
+if (nrow(cnh_raw) > 0) {
+  col_cod_cnh <- intersect(
+    c("cod_ibge", "codigo_ibge", "codigo_municipio", "municipio_codigo",
+      "cod_munic", "codigo", "municipio_cod"),
+    names(cnh_raw)
+  )
+  col_uf_cnh <- intersect(c("uf", "sigla_uf", "estado", "sigla"), names(cnh_raw))
+
+  # Passo 1 — renomear coluna de código
+  cnh <- cnh_raw
+  if (length(col_cod_cnh) > 0 && col_cod_cnh[1] != "cod_ibge")
+    cnh <- rename(cnh, cod_ibge = all_of(col_cod_cnh[1]))
+
+  # Passo 2 — filtrar SP
+  if (length(col_uf_cnh) > 0) {
+    cnh <- filter(cnh, str_to_upper(.data[[col_uf_cnh[1]]]) == "SP")
+  } else if ("cod_ibge" %in% names(cnh)) {
+    cnh <- cnh |>
+      mutate(cod_ibge = padronizar_ibge(cod_ibge)) |>
+      filter(str_starts(cod_ibge, "35"))
+  }
+
+  # Passo 3 — padronizar cod_ibge
+  if ("cod_ibge" %in% names(cnh))
+    cnh <- mutate(cnh, cod_ibge = padronizar_ibge(cod_ibge))
+
+  # Passo 4 — ordenar
+  if ("cod_ibge" %in% names(cnh)) {
+    cnh <- arrange(cnh, cod_ibge, ano)
+  } else {
+    cnh <- arrange(cnh, ano)
+  }
+
+  registrar_objeto("cnh", cnh)
+
+  if ("cod_ibge" %in% names(cnh)) {
+    cnh |> count(ano, name = "municipios") |>
+      knitr::kable(caption = "Municípios na base CNH por Ano")
+  }
+
+  glimpse(cnh)
+} else {
+  cnh <- NULL
+  registrar_objeto("cnh", NULL)
+  cat("Nenhum arquivo de CNH encontrado.\n")
+}
+```
+
+```{r cnh-head, warning=FALSE, message=FALSE}
+if (!is.null(cnh)) {
+  head(cnh, 5) |> knitr::kable(caption = "CNH SP 2019–2024 — Head")
+}
+```
+
+---
+
+# Shapefile dos Municípios
+
+Polígonos vetoriais dos 645 municípios do Estado de São Paulo.
+
+```{r shp-leitura, warning=FALSE, message=FALSE}
+path_shp <- here("data/raw/SP_Municipios/SP_Municipios_2024.shp")
+
+if (!file.exists(path_shp)) {
+  registrar_ausente(path_shp, "10 — Shapefile")
+  sp_mun <- NULL
+} else {
+  sp_mun <- tryCatch({
+    st_read(path_shp, quiet = TRUE) |> clean_names()
+  }, error = function(e) {
+    registrar_ausente(path_shp, paste0("10 — Shapefile [erro: ", e$message, "]"))
+    NULL
+  })
+}
+
+if (!is.null(sp_mun)) {
+  cat("CRS original:", st_crs(sp_mun)$epsg, "\n")
+  cat("Geometria:", as.character(st_geometry_type(sp_mun)[1]), "\n")
+  cat("Municípios:", nrow(sp_mun), "\n")
+} else {
+  cat("Shapefile não disponível.\n")
+}
+
+registrar_objeto("sp_mun", sp_mun)
+```
+
+```{r shp-reprojetar, warning=FALSE, message=FALSE}
+if (!is.null(sp_mun)) {
+  if (!identical(st_crs(sp_mun), st_crs(4674))) {
+    sp_mun <- st_transform(sp_mun, crs = 4674)
+    cat("Reprojetado para EPSG:4674 (SIRGAS 2000)\n")
+  } else {
+    cat("CRS já é EPSG:4674 — nenhuma reprojeção necessária.\n")
+  }
+
+  col_cod_shp <- intersect(
+    c("cd_mun", "cod_ibge", "codigo_ibge", "cd_geocodm", "cod_municipio"),
+    names(sp_mun)
+  )
+  if (length(col_cod_shp) > 0) {
+    if (col_cod_shp[1] != "cod_ibge")
+      sp_mun <- rename(sp_mun, cod_ibge = all_of(col_cod_shp[1]))
+    sp_mun <- mutate(sp_mun, cod_ibge = padronizar_ibge(cod_ibge))
+  }
+}
+```
+
+```{r shp-mapa, warning=FALSE, message=FALSE, fig.cap="Municípios do Estado de São Paulo"}
+if (!is.null(sp_mun)) {
+  plot(st_geometry(sp_mun),
+       col    = "#ECF0F1",
+       border = "#7F8C8D",
+       lwd    = 0.3,
+       main   = paste("São Paulo —", nrow(sp_mun), "municípios (SIRGAS 2000)"))
+} else {
+  cat("Mapa indisponível — shapefile ausente.\n")
+}
+```
+
+---
+
+# Join Mestre
+
+União de todas as bases por `cod_ibge` + `ano`. Bases ausentes são ignoradas
+silenciosamente; o resultado terá colunas `NA` para as fontes faltantes.
+
+```{r join-mestre, warning=FALSE, message=FALSE}
+base_analise <- sinistros_mun |> rename(ano = ano_sinistro)
+
+# 1. + População
+if (!is.null(populacao) && nrow(populacao) > 0) {
+  base_analise <- left_join(
+    base_analise,
+    populacao |> select(cod_ibge, ano, populacao),
+    by = c("cod_ibge", "ano")
+  )
+}
+
+# 2. + Frota
+if (!is.null(frota)) {
+  base_analise <- left_join(
+    base_analise,
+    frota |> select(cod_ibge, ano, any_of(c("total_veiculos", "total"))),
+    by = c("cod_ibge", "ano")
+  )
+}
+
+# 3. + IDHM
+if (!is.null(idhm) && "cod_ibge" %in% names(idhm)) {
+  base_analise <- left_join(
+    base_analise,
+    idhm |> select(cod_ibge, any_of(c("idhm", "idhm_geral", "idhm_total"))),
+    by = "cod_ibge"
+  )
+}
+
+# 4. + CNH
+if (!is.null(cnh)) {
+  base_analise <- left_join(
+    base_analise,
+    cnh |> select(cod_ibge, ano,
+                  any_of(c("total_condutores", "total", "n_condutores"))),
+    by = c("cod_ibge", "ano")
+  )
+}
+
+registrar_objeto("base_analise", base_analise)
+glimpse(base_analise)
+```
+
+```{r join-verificar, warning=FALSE, message=FALSE}
+cat("Municípios únicos:", n_distinct(base_analise$cod_ibge),
+    "(esperado ~645)\n")
+cat("Anos cobertos:", paste(sort(unique(base_analise$ano)), collapse = ", "), "\n")
+cat("Total de linhas:", nrow(base_analise), "\n")
+```
+
+```{r join-missing, warning=FALSE, message=FALSE}
+base_analise |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variavel", values_to = "n_missing") |>
+  mutate(pct_missing = round(n_missing / nrow(base_analise) * 100, 1)) |>
+  filter(n_missing > 0) |>
+  arrange(desc(pct_missing)) |>
+  knitr::kable(caption = "Missing Values por Variável — Base Mestre")
+```
+
+---
+
+# Salvar Bases Processadas
+
+Salva apenas os objetos disponíveis (não-NULL) em `data/processed/`.
+
+```{r salvar, warning=FALSE, message=FALSE}
+path_proc <- here("data/processed")
+
+salvar_se <- function(obj, nome) {
+  if (!is.null(obj)) {
+    saveRDS(obj, file.path(path_proc, nome))
+  }
+}
+
+salvar_se(sinistros,    "sinistros_limpo.rds")
+salvar_se(pessoas,      "pessoas_limpo.rds")
+salvar_se(veiculos,     "veiculos_limpo.rds")
+salvar_se(populacao,    "populacao_limpo.rds")
+salvar_se(frota,        "frota_limpo.rds")
+salvar_se(idhm,         "idhm_limpo.rds")
+salvar_se(cnh,          "cnh_limpo.rds")
+salvar_se(sp_mun,       "sp_municipios.rds")
+salvar_se(base_analise, "base_analise.rds")
+```
+
+```{r salvar-verificar, warning=FALSE, message=FALSE}
+arquivos_salvos <- c(
+  "sinistros_limpo.rds", "pessoas_limpo.rds", "veiculos_limpo.rds",
+  "populacao_limpo.rds", "frota_limpo.rds",   "idhm_limpo.rds",
+  "cnh_limpo.rds",       "sp_municipios.rds", "base_analise.rds"
+)
+
+tibble(
+  arquivo  = arquivos_salvos,
+  existe   = file.exists(file.path(path_proc, arquivos_salvos)),
+  tamanho  = map_chr(file.path(path_proc, arquivos_salvos), ~ {
+    if (file.exists(.x))
+      paste0(round(file.info(.x)$size / 1024, 1), " KB")
+    else "—"
+  })
+) |>
+  knitr::kable(caption = "Confirmação de Salvamento — data/processed/")
+```
+
+---
+
+# Diagnóstico
+
+```{r diagnostico, warning=FALSE, message=FALSE, results='asis'}
+# ---- Arquivos ausentes -------------------------------------------------------
+tab_ausentes <- bind_rows(arquivos_ausentes)
+
+cat("## Arquivos ausentes\n\n")
+if (nrow(tab_ausentes) == 0) {
+  cat('<p style="color:green;font-weight:bold;">',
+      '&#10003; Todos os arquivos foram encontrados.</p>\n\n')
+} else {
+  cat('<p style="color:#c0392b;font-weight:bold;">',
+      '&#9888; ', nrow(tab_ausentes),
+      ' arquivo(s) ausente(s):</p>\n\n')
+  print(knitr::kable(
+    tab_ausentes |> arrange(secao),
+    caption = "Arquivos não encontrados"
+  ))
+}
+
+# ---- Objetos carregados -----------------------------------------------------
+cat("\n## Objetos carregados\n\n")
+tab_obj <- bind_rows(objetos_carregados) |>
+  mutate(status = if_else(ok, "✓ OK", "✗ ausente"))
+
+print(knitr::kable(
+  tab_obj |> select(objeto, linhas, status),
+  caption = "Resumo dos objetos em memória"
+))
+
+# ---- Mensagem final ---------------------------------------------------------
+n_ok      <- sum(tab_obj$ok, na.rm = TRUE)
+n_total   <- nrow(tab_obj)
+n_ausente <- nrow(tab_ausentes)
+
+cat("\n")
+if (n_ausente == 0) {
+  cat('<p style="color:green;font-size:1.1em;font-weight:bold;">',
+      '&#10003; Importação completa: todos os ', n_total,
+      ' objetos carregados com sucesso.</p>\n')
+} else {
+  cat('<p style="color:#c0392b;font-size:1.1em;font-weight:bold;">',
+      '&#9888; Importação parcial: ', n_ok, '/', n_total,
+      ' objetos OK. Adicione os ', n_ausente,
+      ' arquivo(s) ausente(s) listados acima.</p>\n')
+}
+```
+
+---
+
+```{r session-info, echo=FALSE}
+cat("Sessão R:\n")
+sessionInfo()
+```
