@@ -440,11 +440,11 @@ path_frota <- here("data/raw/frota")   # pasta real no repositório
 
 arquivos_frota <- tibble(
   arquivo = c(
-    "frota_munic_modelo_julho_2019.xls",
-    "frota_munic_modelo_julho_2020.xls",
-    "frota_munic_modelo_julho_2021.xls",
-    "frota_munic_modelo_julho_2022.xls",
-    "frota_munic_modelo_julho_2023.xls",
+    "frota_munic_modelo_junho_2019.xls",
+    "frota_munic_modelo_junho_2020.xls",
+    "frota_munic_modelo_junho_2021.xls",
+    "frota_munic_modelo_junho_2022.xls",
+    "frota_munic_modelo_junho_2023.xls",
     "frota_munic_modelo_junho_2024.xlsx"
   ),
   ano = 2019:2024
@@ -598,108 +598,11 @@ registrar_objeto("idhm", idhm)
 
 ---
 
-# CNH — Condutores Habilitados
+# ~~CNH — Condutores Habilitados~~ *(excluída)*
 
-Dados da SENATRAN com número de condutores habilitados por município (posição
-de junho de cada ano).
-
-```{r cnh-leitura, warning=FALSE, message=FALSE}
-path_cnh <- here("data/raw/CNH")
-
-arquivos_cnh <- tibble(
-  arquivo = c(
-    "condutores_habilitados_2019-06.csv",
-    "condutores_habilitados_2020-06.csv",
-    "condutores_habilitados_2021-06.csv",
-    "condutores_habilitados_2022_06.csv",
-    "condudores_habilitados_2023_06.csv",   # typo no nome original
-    "QuantidadedecondutoreshabilitadosporregioufsexofaixaetriaporcategoriaJun2024.csv"
-  ),
-  ano = 2019:2024
-)
-
-ler_cnh <- function(arquivo, ano) {
-  caminho <- file.path(path_cnh, arquivo)
-  if (!file.exists(caminho)) {
-    registrar_ausente(caminho, "9 — CNH")
-    return(NULL)
-  }
-  tryCatch({
-    df <- tryCatch(
-      read_csv2(caminho, locale = locale(encoding = "Latin1"),
-                show_col_types = FALSE),
-      error = function(e)
-        read_csv(caminho, locale = locale(encoding = "Latin1"),
-                 show_col_types = FALSE)
-    )
-    df |> clean_names() |> mutate(ano = ano)
-  }, error = function(e) {
-    registrar_ausente(caminho, paste0("9 — CNH [erro: ", e$message, "]"))
-    NULL
-  })
-}
-
-lista_cnh <- map2(arquivos_cnh$arquivo, arquivos_cnh$ano, ler_cnh)
-cnh_raw   <- bind_rows(lista_cnh)
-
-cat("CNH raw — dimensões:", nrow(cnh_raw), "×", ncol(cnh_raw), "\n")
-if (nrow(cnh_raw) > 0) print(names(cnh_raw))
-```
-
-```{r cnh-limpar, warning=FALSE, message=FALSE}
-if (nrow(cnh_raw) > 0) {
-  col_cod_cnh <- intersect(
-    c("cod_ibge", "codigo_ibge", "codigo_municipio", "municipio_codigo",
-      "cod_munic", "codigo", "municipio_cod"),
-    names(cnh_raw)
-  )
-  col_uf_cnh <- intersect(c("uf", "sigla_uf", "estado", "sigla"), names(cnh_raw))
-
-  # Passo 1 — renomear coluna de código
-  cnh <- cnh_raw
-  if (length(col_cod_cnh) > 0 && col_cod_cnh[1] != "cod_ibge")
-    cnh <- rename(cnh, cod_ibge = all_of(col_cod_cnh[1]))
-
-  # Passo 2 — filtrar SP
-  if (length(col_uf_cnh) > 0) {
-    cnh <- filter(cnh, str_to_upper(.data[[col_uf_cnh[1]]]) == "SP")
-  } else if ("cod_ibge" %in% names(cnh)) {
-    cnh <- cnh |>
-      mutate(cod_ibge = padronizar_ibge(cod_ibge)) |>
-      filter(str_starts(cod_ibge, "35"))
-  }
-
-  # Passo 3 — padronizar cod_ibge
-  if ("cod_ibge" %in% names(cnh))
-    cnh <- mutate(cnh, cod_ibge = padronizar_ibge(cod_ibge))
-
-  # Passo 4 — ordenar
-  if ("cod_ibge" %in% names(cnh)) {
-    cnh <- arrange(cnh, cod_ibge, ano)
-  } else {
-    cnh <- arrange(cnh, ano)
-  }
-
-  registrar_objeto("cnh", cnh)
-
-  if ("cod_ibge" %in% names(cnh)) {
-    cnh |> count(ano, name = "municipios") |>
-      knitr::kable(caption = "Municípios na base CNH por Ano")
-  }
-
-  glimpse(cnh)
-} else {
-  cnh <- NULL
-  registrar_objeto("cnh", NULL)
-  cat("Nenhum arquivo de CNH encontrado.\n")
-}
-```
-
-```{r cnh-head, warning=FALSE, message=FALSE}
-if (!is.null(cnh)) {
-  head(cnh, 5) |> knitr::kable(caption = "CNH SP 2019–2024 — Head")
-}
-```
+<!-- CNH removida do modelo ecológico: os arquivos SENATRAN disponíveis
+     (data/raw/CNH/) são agregados por Região/UF, não por município,
+     impossibilitando o join com cod_ibge. -->
 
 ---
 
@@ -803,16 +706,6 @@ if (!is.null(idhm) && "cod_ibge" %in% names(idhm)) {
   )
 }
 
-# 4. + CNH
-if (!is.null(cnh)) {
-  base_analise <- left_join(
-    base_analise,
-    cnh |> select(cod_ibge, ano,
-                  any_of(c("total_condutores", "total", "n_condutores"))),
-    by = c("cod_ibge", "ano")
-  )
-}
-
 registrar_objeto("base_analise", base_analise)
 glimpse(base_analise)
 ```
@@ -855,7 +748,6 @@ salvar_se(veiculos,     "veiculos_limpo.rds")
 salvar_se(populacao,    "populacao_limpo.rds")
 salvar_se(frota,        "frota_limpo.rds")
 salvar_se(idhm,         "idhm_limpo.rds")
-salvar_se(cnh,          "cnh_limpo.rds")
 salvar_se(sp_mun,       "sp_municipios.rds")
 salvar_se(base_analise, "base_analise.rds")
 ```
@@ -864,7 +756,7 @@ salvar_se(base_analise, "base_analise.rds")
 arquivos_salvos <- c(
   "sinistros_limpo.rds", "pessoas_limpo.rds", "veiculos_limpo.rds",
   "populacao_limpo.rds", "frota_limpo.rds",   "idhm_limpo.rds",
-  "cnh_limpo.rds",       "sp_municipios.rds", "base_analise.rds"
+  "sp_municipios.rds",   "base_analise.rds"
 )
 
 tibble(

@@ -1,0 +1,935 @@
+---
+title: "Análise Ecológica de Acidentes de Trânsito — SP"
+subtitle: "Etapa 2: Análise Descritiva"
+author: "czanchetta"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+# Define raiz do projeto como diretório de trabalho para todos os chunks
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+# Setup
+
+Carrega pacotes, opções globais e bases produzidas pela Etapa 1.
+Inicializa o rastreamento de **10 objetos** que devem estar carregados ao final.
+
+```{r setup-pacotes, echo=TRUE, warning=FALSE, message=FALSE}
+library(here)
+library(readxl)
+source(here::here("R/00_setup.R"))
+
+# ---------------------------------------------------------------------------
+# Rastreamento de objetos (meta-dado para o diagnóstico final)
+# ---------------------------------------------------------------------------
+objetos_carregados <- list()
+
+registrar_objeto <- function(nome, obj) {
+  n  <- if (is.null(obj) || (is.data.frame(obj) && nrow(obj) == 0)) NA_integer_
+        else if (is.data.frame(obj)) nrow(obj)
+        else length(obj)
+  ok <- !is.null(obj) && !is.na(n) && n > 0
+  objetos_carregados[[length(objetos_carregados) + 1]] <<- tibble(
+    objeto = nome,
+    linhas = n,
+    ok     = ok
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Função auxiliar: normaliza nome de município para join por nome
+# ---------------------------------------------------------------------------
+normalizar_mun <- function(x) {
+  x |>
+    iconv(from = "UTF-8", to = "ASCII//TRANSLIT") |>
+    toupper() |>
+    str_remove_all("[^A-Z0-9 ]") |>   # remove apóstrofos, hífens etc.
+    str_squish()
+}
+```
+
+---
+
+# Dados Carregados
+
+## Objetos da Etapa 1 (data/processed/)
+
+```{r carregar-processados}
+path_proc <- here("data/processed")
+
+carregar_rds <- function(nome) {
+  f <- file.path(path_proc, nome)
+  if (!file.exists(f)) { warning("Não encontrado: ", f, call. = FALSE); return(NULL) }
+  obj <- readRDS(f)
+  if (is.data.frame(obj) && nrow(obj) == 0) return(NULL)
+  obj
+}
+
+pessoas      <- carregar_rds("pessoas_limpo.rds")
+sinistros    <- carregar_rds("sinistros_limpo.rds")
+base_analise <- carregar_rds("base_analise.rds")
+
+registrar_objeto("pessoas",      pessoas)
+registrar_objeto("sinistros",    sinistros)
+registrar_objeto("base_analise", base_analise)
+
+for (nm in c("pessoas", "sinistros", "base_analise")) {
+  obj <- get(nm)
+  cat(sprintf("  %-14s : %s\n", nm,
+      if (!is.null(obj)) paste(nrow(obj), "linhas ×", ncol(obj), "cols")
+      else "AUSENTE"))
+}
+```
+
+## Tabela 6579 — Estimativas Populacionais Municipais (2019–2024)
+
+O arquivo `Tabela 6579.xlsx` contém as estimativas populacionais do IBGE para
+todos os municípios brasileiros nos anos 2019, 2020, 2021, 2024 e 2025.
+Os anos 2022 e 2023 são obtidos por interpolação linear entre 2021 e 2024.
+
+> **Nota metodológica:** Os arquivos POP*.xls em `data/raw/População/` contêm
+> apenas totais estaduais, não municipais. A Tabela 6579 é a fonte correta para
+> estimativas por município e deverá ser incorporada à Etapa 1 futuramente.
+
+```{r populacao-tab6579}
+path_tab6579 <- here("data/raw/População/Tabela 6579.xlsx")
+
+if (!file.exists(path_tab6579)) {
+  warning("Tabela 6579.xlsx não encontrada.", call. = FALSE)
+  tab6579_sp <- NULL
+} else {
+  # Leitura: skip=2 pula as 2 linhas de cabeçalho; linha 3 tem os anos
+  raw6579 <- read_excel(path_tab6579, skip = 2, col_names = FALSE)
+  names(raw6579) <- c("municipio_uf", "y2019", "y2020", "y2021", "y2024", "y2025")
+
+  tab6579_sp <- raw6579 |>
+    # Filtra municípios de SP
+    filter(str_detect(municipio_uf, "\\(SP\\)")) |>
+    mutate(
+      municipio_nome = str_remove(municipio_uf, " \\(SP\\)"),
+      mun_norm       = normalizar_mun(municipio_nome),
+      across(y2019:y2025, as.numeric)
+    ) |>
+    # Interpola 2022 e 2023
+    mutate(
+      y2022 = round(y2021 + (2022 - 2021) * (y2024 - y2021) / (2024 - 2021)),
+      y2023 = round(y2021 + (2023 - 2021) * (y2024 - y2021) / (2024 - 2021))
+    ) |>
+    select(municipio_nome, mun_norm, y2019, y2020, y2021, y2022, y2023, y2024)
+}
+
+registrar_objeto("tab6579_sp", tab6579_sp)
+cat("Municípios SP em Tabela 6579:", if (!is.null(tab6579_sp)) nrow(tab6579_sp) else "—", "\n")
+```
+
+```{r populacao-painel-anual}
+# Cria painel longo: cod_ibge × ano → populacao
+pop_mun_anual <- NULL
+
+if (!is.null(tab6579_sp) && !is.null(base_analise)) {
+  # Lookup: nome normalizado → cod_ibge (via base_analise)
+  lookup_ibge <- base_analise |>
+    distinct(cod_ibge, municipio) |>
+    mutate(mun_norm = normalizar_mun(municipio))
+
+  pop_mun_anual <- tab6579_sp |>
+    left_join(lookup_ibge, by = "mun_norm") |>
+    filter(!is.na(cod_ibge)) |>
+    pivot_longer(cols = starts_with("y"), names_to = "ano",
+                 names_prefix = "y", values_to = "populacao") |>
+    mutate(ano = as.integer(ano)) |>
+    filter(ano %in% 2019:2024) |>
+    select(cod_ibge, municipio, ano, populacao)
+
+  n_match  <- n_distinct(pop_mun_anual$cod_ibge)
+  n_total6 <- nrow(tab6579_sp)
+  cat(sprintf("Municípios com população: %d/%d (%.1f%%)\n",
+              n_match, n_total6, n_match / n_total6 * 100))
+  cat("Painel pop_mun_anual:", nrow(pop_mun_anual), "linhas\n")
+}
+
+registrar_objeto("pop_mun_anual", pop_mun_anual)
+```
+
+## Tabela 9514 — Censo 2022: Distribuição Etária e Sexual
+
+Obtida no IBGE SIDRA: população residente por sexo e faixa etária de 5 anos,
+Censo Demográfico 2022, para o Estado de São Paulo e seus 645 municípios.
+Usada (a) como população-padrão no método direto e (b) como proxy da
+distribuição etária municipal para o cálculo dos denominadores por estrato.
+
+```{r tab9514-ler}
+path_tab9514 <- here("data/raw/População/Tabela 9514.xlsx")
+
+tab9514_mun <- NULL
+pop_padrao  <- NULL
+
+if (!file.exists(path_tab9514)) {
+  warning("Tabela 9514.xlsx não encontrada.", call. = FALSE)
+} else {
+  # Estrutura da tabela:
+  #   Linhas 1–7 : cabeçalhos (título, variável, forma, ano, sexo-bloco, idade-bloco)
+  #   Linha 8    : "São Paulo" — total estadual
+  #   Linhas 9–653: municípios "Nome (SP)"
+  #
+  # 67 colunas = 1 nome + 3 blocos × 22 (total + 21 faixas etárias)
+  #   Cols  2–23: Total  (ambos os sexos)
+  #   Cols 24–45: Homens
+  #   Cols 46–67: Mulheres
+
+  faixas_censo <- c(
+    "0_4",  "5_9",  "10_14", "15_19", "20_24", "25_29", "30_34",
+    "35_39","40_44","45_49", "50_54", "55_59", "60_64", "65_69",
+    "70_74","75_79","80_84", "85_89", "90_94", "95_99", "100plus"
+  )
+  nomes_cols <- c(
+    "municipio_uf",
+    paste0("t_",  c("total", faixas_censo)),
+    paste0("m_",  c("total", faixas_censo)),
+    paste0("f_",  c("total", faixas_censo))
+  )
+
+  # Lê a partir da linha 8 (skip=7)
+  raw9514 <- read_excel(path_tab9514, skip = 7, col_names = nomes_cols) |>
+    filter(!is.na(municipio_uf)) |>
+    mutate(across(-municipio_uf, as.numeric))
+
+  # ── Linha do Estado de SP (população-padrão) ────────────────────────────
+  sp_row <- raw9514 |> filter(municipio_uf == "São Paulo")
+
+  # Mapeamento faixas Censo → InfoSiga (faixa_etaria_demografica)
+  # InfoSiga usa grupos como "00 a 04", "05 a 09", ..., "90 e +"
+  map_faixas <- tibble(
+    faixa_infosiga = c(
+      "00 a 04","05 a 09","10 a 14","15 a 19","20 a 24",
+      "25 a 29","30 a 34","35 a 39","40 a 44","45 a 49",
+      "50 a 54","55 a 59","60 a 64","65 a 69","70 a 74",
+      "75 a 79","80 a 84","85 a 89","90 e +","90 e +","90 e +"
+    ),
+    col_m = paste0("m_", c(
+      "0_4","5_9","10_14","15_19","20_24","25_29","30_34","35_39",
+      "40_44","45_49","50_54","55_59","60_64","65_69","70_74",
+      "75_79","80_84","85_89","90_94","95_99","100plus"
+    )),
+    col_f = paste0("f_", c(
+      "0_4","5_9","10_14","15_19","20_24","25_29","30_34","35_39",
+      "40_44","45_49","50_54","55_59","60_64","65_69","70_74",
+      "75_79","80_84","85_89","90_94","95_99","100plus"
+    ))
+  )
+
+  # Extrai pop-padrão estadual por faixa × sexo
+  pop_padrao <- map_faixas |>
+    rowwise() |>
+    mutate(
+      m_std = sp_row[[col_m]],
+      f_std = sp_row[[col_f]]
+    ) |>
+    ungroup() |>
+    group_by(faixa_infosiga) |>
+    summarise(
+      MASCULINO = sum(m_std, na.rm = TRUE),
+      FEMININO  = sum(f_std, na.rm = TRUE),
+      .groups   = "drop"
+    ) |>
+    pivot_longer(c(MASCULINO, FEMININO), names_to = "sexo", values_to = "pop_std") |>
+    mutate(w_i = pop_std / sum(pop_std)) |>
+    rename(faixa_etaria = faixa_infosiga)
+
+  # ── Municípios SP ────────────────────────────────────────────────────────
+  tab9514_mun <- raw9514 |>
+    filter(str_detect(municipio_uf, "\\(SP\\)")) |>
+    mutate(
+      municipio_nome = str_remove(municipio_uf, " \\(SP\\)"),
+      mun_norm       = normalizar_mun(municipio_nome)
+    )
+
+  cat("Municípios SP em Tabela 9514:", nrow(tab9514_mun), "\n")
+  cat("Pop-padrão SP (Census 2022):",
+      format(sum(pop_padrao$pop_std), big.mark = "."), "hab.\n")
+}
+
+registrar_objeto("tab9514_mun", tab9514_mun)
+registrar_objeto("pop_padrao",  pop_padrao)
+```
+
+```{r pop-padrao-tabela}
+if (!is.null(pop_padrao)) {
+  pop_padrao |>
+    select(faixa_etaria, sexo, pop_std) |>
+    pivot_wider(names_from = sexo, values_from = pop_std) |>
+    mutate(
+      total = MASCULINO + FEMININO,
+      pct   = round(total / sum(total) * 100, 1),
+      across(MASCULINO:total, ~ format(.x, big.mark = "."))
+    ) |>
+    knitr::kable(
+      caption = paste0("População-Padrão — SP, Censo 2022 (IBGE, Tabela 9514) · ",
+                       "Total: ", format(sum(pop_padrao$pop_std), big.mark = "."),
+                       " hab."),
+      col.names = c("Faixa Etária (InfoSiga)", "Masculino", "Feminino", "Total", "%")
+    )
+}
+```
+
+---
+
+# Perfil das Vítimas e Sinistros
+
+Análise descritiva das características individuais das vítimas (`pessoas`,
+n = `r if (!is.null(pessoas)) format(nrow(pessoas), big.mark=".") else "—"`)
+referentes ao período 2019–2024 nos municípios do Estado de São Paulo.
+
+## Tipo de Vítima
+
+```{r tipo-vitima}
+if (!is.null(pessoas)) {
+  pessoas |>
+    count(tipo_de_vitima, sort = TRUE, name = "n") |>
+    filter(!is.na(tipo_de_vitima)) |>
+    mutate(
+      pct       = round(n / sum(n) * 100, 1),
+      n_fmt     = format(n, big.mark = ".")
+    ) |>
+    select(tipo_de_vitima, n_fmt, pct) |>
+    knitr::kable(
+      caption    = "Frequência — Tipo de Vítima (2019–2024)",
+      col.names  = c("Tipo de Vítima", "n", "%")
+    )
+} else {
+  cat("Base pessoas não disponível.\n")
+}
+```
+
+## Gravidade da Lesão
+
+```{r gravidade-lesao}
+if (!is.null(pessoas)) {
+  # Ordem lógica de gravidade
+  ordem_grav <- c("FATAL", "GRAVE", "LEVE", "NAO DISPONIVEL")
+
+  pessoas |>
+    count(gravidade_lesao, sort = FALSE, name = "n") |>
+    filter(!is.na(gravidade_lesao)) |>
+    mutate(
+      gravidade_lesao = factor(gravidade_lesao, levels = ordem_grav),
+      pct   = round(n / sum(n) * 100, 1),
+      n_fmt = format(n, big.mark = ".")
+    ) |>
+    arrange(gravidade_lesao) |>
+    select(gravidade_lesao, n_fmt, pct) |>
+    knitr::kable(
+      caption   = "Frequência — Gravidade da Lesão (2019–2024)",
+      col.names = c("Gravidade", "n", "%")
+    )
+} else {
+  cat("Base pessoas não disponível.\n")
+}
+```
+
+## Sexo
+
+```{r sexo}
+if (!is.null(pessoas)) {
+  pessoas |>
+    count(sexo, sort = TRUE, name = "n") |>
+    filter(!is.na(sexo)) |>
+    mutate(
+      pct   = round(n / sum(n) * 100, 1),
+      n_fmt = format(n, big.mark = ".")
+    ) |>
+    select(sexo, n_fmt, pct) |>
+    knitr::kable(
+      caption   = "Frequência — Sexo (2019–2024)",
+      col.names = c("Sexo", "n", "%")
+    )
+} else {
+  cat("Base pessoas não disponível.\n")
+}
+```
+
+## Faixa Etária Demográfica
+
+```{r faixa-etaria}
+if (!is.null(pessoas)) {
+  # Ordem das faixas (formato InfoSiga: "00 a 04", "05 a 09", ...)
+  faixas_ord <- c(
+    "00 a 04","05 a 09","10 a 14","15 a 19","20 a 24",
+    "25 a 29","30 a 34","35 a 39","40 a 44","45 a 49",
+    "50 a 54","55 a 59","60 a 64","65 a 69","70 a 74",
+    "75 a 79","80 a 84","85 a 89","90 e +","NAO DISPONIVEL"
+  )
+
+  pessoas |>
+    count(faixa_etaria_demografica, sort = FALSE, name = "n") |>
+    filter(!is.na(faixa_etaria_demografica)) |>
+    mutate(
+      faixa_etaria_demografica = factor(faixa_etaria_demografica,
+                                        levels = faixas_ord),
+      pct   = round(n / sum(n) * 100, 1),
+      n_fmt = format(n, big.mark = ".")
+    ) |>
+    arrange(faixa_etaria_demografica) |>
+    select(faixa_etaria_demografica, n_fmt, pct) |>
+    knitr::kable(
+      caption   = "Frequência — Faixa Etária Demográfica (2019–2024)",
+      col.names = c("Faixa Etária", "n", "%")
+    )
+} else {
+  cat("Base pessoas não disponível.\n")
+}
+```
+
+## Gravidade × Sexo
+
+```{r gravidade-sexo}
+if (!is.null(pessoas)) {
+  ordem_grav <- c("FATAL", "GRAVE", "LEVE", "NAO DISPONIVEL")
+
+  pessoas |>
+    filter(!is.na(gravidade_lesao), !is.na(sexo)) |>
+    count(gravidade_lesao, sexo, name = "n") |>
+    mutate(gravidade_lesao = factor(gravidade_lesao, levels = ordem_grav)) |>
+    arrange(gravidade_lesao, sexo) |>
+    group_by(gravidade_lesao) |>
+    mutate(
+      pct_gravidade = round(n / sum(n) * 100, 1),
+      n_fmt         = format(n, big.mark = ".")
+    ) |>
+    ungroup() |>
+    select(gravidade_lesao, sexo, n_fmt, pct_gravidade) |>
+    knitr::kable(
+      caption   = "Gravidade × Sexo — Distribuição (2019–2024)",
+      col.names = c("Gravidade", "Sexo", "n", "% dentro de Gravidade")
+    )
+}
+```
+
+---
+
+# Taxas Brutas por Município × Ano
+
+## Cálculo das Taxas Brutas
+
+Integra `base_analise` com `pop_mun_anual` (Tabela 6579) e computa:
+
+| Indicador | Fórmula |
+|---|---|
+| Taxa Bruta de Mortalidade (TBM) | óbitos / pop × 100.000 |
+| Taxa Bruta de Não Fatais (TBNF) | não fatais / pop × 100.000 |
+| Razão de Letalidade (RL) | óbitos / total sinistros |
+
+```{r taxas-calcular}
+taxas <- NULL
+
+if (!is.null(base_analise) && !is.null(pop_mun_anual)) {
+  taxas <- base_analise |>
+    left_join(pop_mun_anual |> select(cod_ibge, ano, populacao),
+              by = c("cod_ibge", "ano")) |>
+    filter(!is.na(populacao), populacao > 0) |>
+    mutate(
+      tbm          = n_obitos    / populacao * 1e5,
+      tb_nao_fatal = n_nao_fatal / populacao * 1e5,
+      razao_letal  = if_else(n_total_sinistros > 0,
+                              n_obitos / n_total_sinistros,
+                              NA_real_)
+    )
+
+  cat(sprintf("taxas: %d linhas — %d municípios × %d anos\n",
+              nrow(taxas), n_distinct(taxas$cod_ibge), n_distinct(taxas$ano)))
+} else {
+  cat("Dados insuficientes para cálculo de taxas.\n")
+  if (is.null(pop_mun_anual)) cat("  → pop_mun_anual ausente\n")
+}
+
+registrar_objeto("taxas", taxas)
+```
+
+## Taxa Bruta de Mortalidade (TBM)
+
+Óbitos por 100.000 habitantes, por município e ano.
+
+```{r tbm-resumo}
+if (!is.null(taxas)) {
+  taxas |>
+    group_by(ano) |>
+    summarise(
+      municipios  = n(),
+      mediana     = round(median(tbm,             na.rm = TRUE), 2),
+      media       = round(mean(tbm,               na.rm = TRUE), 2),
+      p25         = round(quantile(tbm, 0.25,     na.rm = TRUE), 2),
+      p75         = round(quantile(tbm, 0.75,     na.rm = TRUE), 2),
+      max         = round(max(tbm,                na.rm = TRUE), 2),
+      .groups = "drop"
+    ) |>
+    knitr::kable(
+      caption   = "TBM (por 100.000 hab.) — Distribuição por Ano",
+      col.names = c("Ano", "N mun.", "Mediana", "Média", "P25", "P75", "Máx.")
+    )
+}
+```
+
+```{r tbm-boxplot}
+if (!is.null(taxas)) {
+  taxas |>
+    mutate(ano = factor(ano)) |>
+    ggplot(aes(x = ano, y = tbm)) +
+    geom_boxplot(fill = "#C0392B", alpha = 0.55, outlier.size = 0.8,
+                 outlier.alpha = 0.5) +
+    labs(
+      title    = "Taxa Bruta de Mortalidade por Acidente de Trânsito",
+      subtitle = "Municípios do Estado de SP — 2019–2024",
+      x = "Ano", y = "TBM (por 100.000 hab.)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+}
+```
+
+## Taxa Bruta de Acidentes Não Fatais (TBNF)
+
+Vítimas com desfecho não fatal (graves + leves + ilesos) por 100.000 habitantes.
+
+```{r tb-nf-resumo}
+if (!is.null(taxas)) {
+  taxas |>
+    group_by(ano) |>
+    summarise(
+      municipios = n(),
+      mediana    = round(median(tb_nao_fatal,         na.rm = TRUE), 1),
+      media      = round(mean(tb_nao_fatal,           na.rm = TRUE), 1),
+      p25        = round(quantile(tb_nao_fatal, 0.25, na.rm = TRUE), 1),
+      p75        = round(quantile(tb_nao_fatal, 0.75, na.rm = TRUE), 1),
+      .groups    = "drop"
+    ) |>
+    knitr::kable(
+      caption   = "TBNF (por 100.000 hab.) — Distribuição por Ano",
+      col.names = c("Ano", "N mun.", "Mediana", "Média", "P25", "P75")
+    )
+}
+```
+
+## Razão de Letalidade (RL)
+
+Proporção de sinistros com desfecho fatal (óbitos / total de sinistros × 100).
+
+```{r razao-letal-resumo}
+if (!is.null(taxas)) {
+  taxas |>
+    group_by(ano) |>
+    summarise(
+      municipios = n(),
+      mediana    = round(median(razao_letal * 100,         na.rm = TRUE), 2),
+      media      = round(mean(razao_letal * 100,           na.rm = TRUE), 2),
+      p25        = round(quantile(razao_letal * 100, 0.25, na.rm = TRUE), 2),
+      p75        = round(quantile(razao_letal * 100, 0.75, na.rm = TRUE), 2),
+      .groups    = "drop"
+    ) |>
+    knitr::kable(
+      caption   = "Razão de Letalidade (%) — Distribuição por Ano",
+      col.names = c("Ano", "N mun.", "Mediana", "Média", "P25", "P75")
+    )
+}
+```
+
+## Síntese Estadual por Ano
+
+```{r sintese-estadual}
+if (!is.null(taxas)) {
+  taxas |>
+    group_by(ano) |>
+    summarise(
+      municipios      = n_distinct(cod_ibge),
+      pop_sp          = sum(populacao,         na.rm = TRUE),
+      obitos          = sum(n_obitos,           na.rm = TRUE),
+      nao_fatais      = sum(n_nao_fatal,        na.rm = TRUE),
+      sinistros       = sum(n_total_sinistros,  na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      tbm_sp   = round(obitos    / pop_sp * 1e5, 2),
+      tbnf_sp  = round(nao_fatais / pop_sp * 1e5, 1),
+      rl_sp    = round(obitos / sinistros * 100, 2),
+      pop_sp   = format(pop_sp, big.mark = "."),
+      obitos   = format(obitos, big.mark = "."),
+      sinistros = format(sinistros, big.mark = ".")
+    ) |>
+    knitr::kable(
+      caption   = "Indicadores Estaduais SP — 2019–2024",
+      col.names = c("Ano", "Municípios", "Pop. SP", "Óbitos", "Não fatais",
+                    "Sinistros", "TBM", "TBNF", "RL (%)")
+    )
+}
+```
+
+---
+
+# Taxa Padronizada de Mortalidade — Método Direto
+
+## Fundamentação Metodológica
+
+A **padronização direta** de taxas de mortalidade é empregada quando se deseja
+comparar municípios com estruturas etárias e de sexo distintas, eliminando o
+efeito dessas variáveis como potenciais fatores de confusão nas comparações
+ecológicas. Sem padronização, municípios com maior proporção de idosos ou de
+homens tendem a apresentar taxas brutas infladas em relação a municípios mais
+jovens ou com maior proporção de mulheres, mesmo que a mortalidade intrínseca
+seja equivalente.
+
+### Fórmula
+
+$$\text{TPD}_{m,t} =
+  \frac{\displaystyle\sum_{i} r_{m,t,i} \cdot W_i}
+       {\displaystyle\sum_{i} W_i}
+  \times 100.000$$
+
+onde:
+
+- $r_{m,t,i} = d_{m,t,i} / P_{m,t,i}$ é a taxa específica de mortalidade no
+  estrato $i$ (faixa etária × sexo) do município $m$ no ano $t$;
+- $d_{m,t,i}$ são os óbitos registrados no estrato $i$ (tabela **pessoas**,
+  campo `gravidade_lesao == "FATAL"`);
+- $P_{m,t,i}$ é a população estimada no estrato $i$ do município $m$ no ano $t$;
+- $W_i$ é a população do estrato $i$ na população-padrão.
+
+### População-padrão
+
+Utilizou-se a população do **Estado de São Paulo — Censo Demográfico 2022
+(IBGE, Tabela 9514)**, estratificada por faixa etária e sexo, conforme as
+categorias `faixa_etaria_demografica` e `sexo` da tabela `pessoas`.
+A escolha justifica-se por: (a) ser o nível de agregação do estudo;
+(b) representar a distribuição demográfica atual da população em risco no
+mesmo espaço geográfico; e (c) facilitar comparações com outros estudos que
+adotem a mesma referência nacional/estadual.
+
+### Denominadores por estrato municipal
+
+Os denominadores $P_{m,t,i}$ são estimados em duas etapas:
+
+1. **Proporção etária-sexual municipal** — para cada município, obtém-se a
+   fração da população em cada estrato $i$ a partir do Censo 2022 (Tabela 9514):
+   $\pi_{m,i} = P_{m,i}^{(2022)} / P_{m}^{(2022)}$.
+
+2. **Projeção anual** — a proporção municipal é aplicada à estimativa anual
+   total do município (Tabela 6579, IBGE):
+   $P_{m,t,i} \approx P_{m,t} \times \pi_{m,i}$.
+
+Essa abordagem assume que a **composição etária-sexual intra-municipal** se
+mantém estável entre 2019 e 2024, variando apenas o total populacional.
+É uma simplificação adequada para períodos curtos (≤ 6 anos) e é
+preferível ao uso de proporções estaduais, pois preserva a heterogeneidade
+demográfica entre municípios — condição necessária para que a TPD divirja da
+taxa bruta.
+
+## Preparação dos Denominadores por Estrato
+
+```{r tpm-denominadores}
+# Constrói a tabela de proporções municipais (Censo 2022) por faixa × sexo
+pop_mun_prop <- NULL
+
+if (!is.null(tab9514_mun) && !is.null(pop_mun_anual) && !is.null(pop_padrao)) {
+  # Lookup município
+  lookup_ibge <- base_analise |>
+    distinct(cod_ibge, municipio) |>
+    mutate(mun_norm = normalizar_mun(municipio))
+
+  # Formata tab9514_mun em long: cod_ibge × faixa_infosiga × sexo → prop_censo
+  tab9514_long <- tab9514_mun |>
+    left_join(lookup_ibge, by = "mun_norm") |>
+    filter(!is.na(cod_ibge)) |>
+    # Seleciona somente colunas de interesse: m_ e f_ por faixa etária
+    select(cod_ibge, m_total, f_total, starts_with("m_"), starts_with("f_")) |>
+    pivot_longer(
+      cols      = -cod_ibge,
+      names_to  = "col_censo",
+      values_to = "pop_censo"
+    ) |>
+    filter(col_censo != "m_total", col_censo != "f_total") |>
+    mutate(
+      sexo_censo = if_else(str_starts(col_censo, "m_"), "MASCULINO", "FEMININO"),
+      faixa_col  = str_remove(col_censo, "^[mf]_")
+    )
+
+  # Mapeamento faixa_col (Censo) → faixa_infosiga
+  map_col_faixa <- tibble(
+    faixa_col      = c(
+      "0_4","5_9","10_14","15_19","20_24","25_29","30_34","35_39",
+      "40_44","45_49","50_54","55_59","60_64","65_69","70_74",
+      "75_79","80_84","85_89","90_94","95_99","100plus"
+    ),
+    faixa_infosiga = c(
+      "00 a 04","05 a 09","10 a 14","15 a 19","20 a 24","25 a 29",
+      "30 a 34","35 a 39","40 a 44","45 a 49","50 a 54","55 a 59",
+      "60 a 64","65 a 69","70 a 74","75 a 79","80 a 84","85 a 89",
+      "90 e +","90 e +","90 e +"
+    )
+  )
+
+  # Agrega e calcula proporção
+  pop_mun_prop <- tab9514_long |>
+    left_join(map_col_faixa, by = "faixa_col") |>
+    group_by(cod_ibge, sexo_censo, faixa_infosiga) |>
+    summarise(pop_censo = sum(pop_censo, na.rm = TRUE), .groups = "drop") |>
+    group_by(cod_ibge) |>
+    mutate(prop_censo = pop_censo / sum(pop_censo, na.rm = TRUE)) |>
+    ungroup() |>
+    rename(sexo = sexo_censo, faixa_etaria = faixa_infosiga)
+
+  cat(sprintf("pop_mun_prop: %d linhas — %d municípios\n",
+              nrow(pop_mun_prop), n_distinct(pop_mun_prop$cod_ibge)))
+} else {
+  cat("Dados insuficientes para denomin. estratificados.\n")
+}
+```
+
+## Preparação dos Óbitos por Estrato
+
+```{r obitos-estrato}
+obitos_estrato <- NULL
+
+if (!is.null(pessoas)) {
+  # Conta óbitos (gravidade_lesao == "FATAL") por município × ano × faixa × sexo
+  # Exclui estratos com sexo/faixa não informados
+  obitos_estrato <- pessoas |>
+    filter(
+      gravidade_lesao         == "FATAL",
+      sexo                    != "NAO DISPONIVEL",
+      faixa_etaria_demografica != "NAO DISPONIVEL",
+      !is.na(sexo),
+      !is.na(faixa_etaria_demografica),
+      !is.na(cod_ibge)
+    ) |>
+    mutate(
+      cod_ibge = str_pad(as.character(as.integer(cod_ibge)), 7, "left", "0")
+    ) |>
+    count(cod_ibge, ano = ano_sinistro, faixa_etaria = faixa_etaria_demografica,
+          sexo, name = "d_estrato")
+
+  cat(sprintf("obitos_estrato: %d combinações — %d municípios\n",
+              nrow(obitos_estrato), n_distinct(obitos_estrato$cod_ibge)))
+  cat(sprintf("Total óbitos estratificados: %s\n",
+              format(sum(obitos_estrato$d_estrato), big.mark = ".")))
+} else {
+  cat("Base pessoas não disponível.\n")
+}
+
+registrar_objeto("obitos_estrato", obitos_estrato)
+```
+
+## Cálculo da Taxa Padronizada Direta (TPD)
+
+```{r tpm-calcular}
+tpm_mun <- NULL
+
+if (!is.null(obitos_estrato) && !is.null(pop_mun_prop) &&
+    !is.null(pop_mun_anual)  && !is.null(pop_padrao)) {
+
+  # ── Denominador: P_mti = pop_total × prop_censo ──────────────────────────
+  denom <- pop_mun_anual |>
+    crossing(
+      pop_padrao |> distinct(faixa_etaria, sexo)
+    ) |>
+    # Recria tabela de pares municipio × ano × faixa × sexo de forma explícita
+    left_join(
+      pop_mun_prop |> select(cod_ibge, faixa_etaria, sexo, prop_censo),
+      by = c("cod_ibge", "faixa_etaria", "sexo")
+    ) |>
+    mutate(pop_estrato = populacao * replace_na(prop_censo, 0))
+
+  # ── Numerador: óbitos por estrato ─────────────────────────────────────────
+  calc <- denom |>
+    left_join(obitos_estrato,
+              by = c("cod_ibge", "ano", "faixa_etaria", "sexo")) |>
+    replace_na(list(d_estrato = 0)) |>
+    mutate(
+      r_i = if_else(pop_estrato > 0, d_estrato / pop_estrato * 1e5, 0)
+    )
+
+  # ── TPD = Σ(r_i × W_i) / ΣW_i ────────────────────────────────────────────
+  tpm_mun <- calc |>
+    left_join(pop_padrao |> select(faixa_etaria, sexo, w_i),
+              by = c("faixa_etaria", "sexo")) |>
+    group_by(cod_ibge, municipio, ano, populacao) |>
+    summarise(
+      tpm = sum(r_i * w_i, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    left_join(taxas |> select(cod_ibge, ano, tbm, tb_nao_fatal, razao_letal),
+              by = c("cod_ibge", "ano"))
+
+  cat(sprintf("tpm_mun: %d linhas — %d municípios × %d anos\n",
+              nrow(tpm_mun), n_distinct(tpm_mun$cod_ibge), n_distinct(tpm_mun$ano)))
+} else {
+  cat("Cálculo da TPD não realizado — verifique objetos anteriores.\n")
+}
+
+registrar_objeto("tpm_mun", tpm_mun)
+```
+
+## Resultados — Distribuição da TPD
+
+```{r tpm-resumo-anual}
+if (!is.null(tpm_mun)) {
+  tpm_mun |>
+    group_by(ano) |>
+    summarise(
+      municipios  = n(),
+      tpm_mediana = round(median(tpm, na.rm = TRUE), 2),
+      tpm_media   = round(mean(tpm,   na.rm = TRUE), 2),
+      tpm_p25     = round(quantile(tpm, 0.25, na.rm = TRUE), 2),
+      tpm_p75     = round(quantile(tpm, 0.75, na.rm = TRUE), 2),
+      tbm_mediana = round(median(tbm, na.rm = TRUE), 2),
+      .groups = "drop"
+    ) |>
+    knitr::kable(
+      caption   = "TPD × TBM — Distribuição por Ano (por 100.000 hab.)",
+      col.names = c("Ano", "N mun.", "TPD med.", "TPD méd.",
+                    "TPD P25", "TPD P75", "TBM med.")
+    )
+}
+```
+
+```{r tpm-correlacao}
+if (!is.null(tpm_mun) && sum(!is.na(tpm_mun$tpm)) > 10) {
+  r_pearson <- cor(tpm_mun$tpm, tpm_mun$tbm, use = "complete.obs")
+  cat(sprintf("Correlação Pearson (TPD × TBM): %.4f\n", r_pearson))
+  cat("(Divergência de 1,0 reflete diferenças nas estruturas etárias municipais.)\n\n")
+}
+```
+
+```{r tpm-top10}
+if (!is.null(tpm_mun)) {
+  tpm_mun |>
+    group_by(cod_ibge, municipio) |>
+    summarise(
+      tpm_media  = round(mean(tpm, na.rm = TRUE), 2),
+      tbm_media  = round(mean(tbm, na.rm = TRUE), 2),
+      pop_media  = round(mean(populacao, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    slice_max(tpm_media, n = 10) |>
+    mutate(pop_media = format(pop_media, big.mark = ".")) |>
+    knitr::kable(
+      caption   = "Top 10 Municípios — Maior TPD Média (2019–2024)",
+      col.names = c("Cód. IBGE", "Município", "TPD média", "TBM média", "Pop. média")
+    )
+}
+```
+
+```{r tpm-evolucao-plot}
+if (!is.null(tpm_mun)) {
+  tpm_mun |>
+    group_by(ano) |>
+    summarise(
+      tpm_mediana = median(tpm, na.rm = TRUE),
+      tbm_mediana = median(tbm, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    pivot_longer(c(tpm_mediana, tbm_mediana),
+                 names_to = "indicador", values_to = "taxa") |>
+    mutate(indicador = recode(indicador,
+                              tpm_mediana = "TPD (padronizada)",
+                              tbm_mediana = "TBM (bruta)")) |>
+    ggplot(aes(x = ano, y = taxa, color = indicador, group = indicador)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2.5) +
+    scale_color_manual(values = c("TPD (padronizada)" = "#2C3E50",
+                                   "TBM (bruta)"       = "#C0392B")) +
+    labs(
+      title    = "Mediana da TBM e TPD nos Municípios SP — 2019–2024",
+      subtitle = "Padronização direta; pop.-padrão: SP Censo 2022",
+      x = "Ano", y = "Taxa por 100.000 hab.", color = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom", panel.grid.minor = element_blank())
+}
+```
+
+---
+
+# Salvar Bases Processadas
+
+```{r salvar}
+path_proc <- here("data/processed")
+
+salvar_se <- function(obj, nome) {
+  if (!is.null(obj) && is.data.frame(obj) && nrow(obj) > 0)
+    saveRDS(obj, file.path(path_proc, nome))
+}
+
+salvar_se(pop_mun_anual,  "populacao_limpo.rds")   # sobrescreve a versão vazia
+salvar_se(taxas,          "taxas_descritiva.rds")
+salvar_se(obitos_estrato, "obitos_estrato.rds")
+salvar_se(tpm_mun,        "tpm_municipios.rds")
+```
+
+```{r salvar-verificar}
+arquivos <- c("populacao_limpo.rds", "taxas_descritiva.rds",
+              "obitos_estrato.rds",  "tpm_municipios.rds")
+
+tibble(
+  arquivo  = arquivos,
+  existe   = file.exists(file.path(path_proc, arquivos)),
+  tamanho  = map_chr(file.path(path_proc, arquivos), ~ {
+    if (file.exists(.x)) paste0(round(file.info(.x)$size / 1024, 1), " KB")
+    else "—"
+  })
+) |>
+  knitr::kable(caption = "Confirmação de Salvamento — data/processed/")
+```
+
+---
+
+# Diagnóstico
+
+```{r diagnostico, results='asis'}
+# ── Tabela de objetos ─────────────────────────────────────────────────────
+tab_obj <- bind_rows(objetos_carregados) |>
+  mutate(status = if_else(ok, "✓ OK", "✗ ausente"))
+
+cat("## Objetos rastreados\n\n")
+print(knitr::kable(
+  tab_obj |> select(objeto, linhas, status),
+  caption = "Resumo dos 10 objetos — Etapa 2"
+))
+
+n_ok    <- sum(tab_obj$ok, na.rm = TRUE)
+n_total <- nrow(tab_obj)
+
+cat("\n")
+if (n_ok == n_total) {
+  cat('<p style="color:green;font-size:1.1em;font-weight:bold;">',
+      '&#10003; Descritiva completa:', n_ok, '/', n_total,
+      'objetos calculados com sucesso.</p>\n')
+} else {
+  cat('<p style="color:#c0392b;font-size:1.1em;font-weight:bold;">',
+      '&#9888; Descritiva parcial:', n_ok, '/', n_total,
+      'objetos OK. Verifique os ausentes acima.</p>\n')
+}
+```
+
+---
+
+```{r session-info, echo=FALSE}
+cat("Sessão R:\n")
+sessionInfo()
+```
